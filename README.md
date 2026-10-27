@@ -1,277 +1,405 @@
 # Autonomous AI Recruiter & Auto-Scheduler
 
-A Streamlit + PostgreSQL application that automates the first stage of hiring:
+An AI-assisted hiring pipeline. Candidates upload a resume. An LLM reads it, and a **deterministic SQL/Python engine** decides eligibility against the job's hard constraints. HR reviews the uncertain cases. Approved candidates are booked into a **real Google Calendar slot**, with no double-booking.
 
-1. HR posts a job with hard constraints: minimum experience, mandatory skills and preferred skills.
-2. A candidate uploads a PDF or DOCX resume.
-3. **Agent 1 (two LLM calls)** extracts facts, and Python normalizes the skills. The second LLM call validates the result, then Python grounds every skill in the resume text.
-4. **Python** calculates the authoritative experience from employment dates.
-5. A **deterministic SQL/Python engine** returns ELIGIBLE, NOT_ELIGIBLE or REVIEW_REQUIRED, with an explanation for each requirement.
-6. HR reviews and corrects uncertain cases, then approves.
-7. **Agent 2** finds real panel availability in Google Calendar and books the interview without conflicts. It sends the invitation only after the booking is confirmed.
-
-Everything runs in **mock mode** without any paid API or Google/SMTP credentials. Only PostgreSQL is required.
+> **Core principle - AI reads, rules decide.** The LLM only extracts and verifies facts from resumes. Experience calculation, screening, booking and every status change are plain Python and SQL, so results are reproducible, explainable and auditable.
 
 ---
 
-## 1. Architecture
+## Table of contents
+
+1. [Features](#1-features)
+2. [Tech stack](#2-tech-stack)
+3. [Architecture](#3-architecture)
+4. [Quick start](#4-quick-start)
+5. [Configuration](#5-configuration)
+6. [Using the app](#6-using-the-app)
+7. [How it works](#7-how-it-works)
+8. [Database](#8-database)
+9. [Project structure](#9-project-structure)
+10. [Testing](#10-testing)
+11. [Developer tools](#11-developer-tools)
+12. [Security and privacy](#12-security-and-privacy)
+13. [Troubleshooting](#13-troubleshooting)
+
+---
+
+## 1. Features
+
+**For candidates**
+- Upload a PDF or DOCX resume. Name and email are read from the resume automatically.
+- Instant result: *Eligible*, *Needs review* or *Not eligible*, with the unmet requirements.
+- Track status with application ID + email. Re-apply after a rejection (each attempt gets a new ID).
+
+**For HR**
+- Post jobs with minimum experience plus mandatory and preferred skills. Aliases are resolved (`ML` → Machine Learning, `torch` → PyTorch).
+- Dashboard with pipeline counts and every applicant's status.
+- Candidate review: evidence for each requirement, correction of extracted data, re-screening. Everything is audited.
+- Approve, reject, or override with a recorded reason.
+
+**Scheduling**
+- Real panel availability from Google Calendar (free/busy across all panel calendars).
+- Conflict-safe booking enforced by the database, with a Google Meet link.
+- Invitation email with an `.ics` calendar file, sent only after the booking is confirmed and never twice.
+
+**Engineering**
+- Two-call LLM pipeline (extract → validate) with strict JSON schemas and Python grounding checks.
+- LangGraph workflows with explicit states, error routing and human-review checkpoints.
+- **Mock mode** for every integration (LLM, calendar, email), so it runs and is tested without any credentials.
+- 109 automated tests (unit + integration against real PostgreSQL).
+
+---
+
+## 2. Tech stack
+
+| Layer | Technology |
+|---|---|
+| UI | Streamlit |
+| Workflow orchestration | LangGraph |
+| LLM | Google Gemini (`google-genai`, JSON-schema structured output) |
+| Validation | Pydantic 2 |
+| Database | PostgreSQL · SQLAlchemy 2 · psycopg 3 |
+| Local database runtime | `pgserver` (portable PostgreSQL inside the virtualenv, no install needed) |
+| Resume parsing | PyMuPDF (PDF), python-docx (DOCX) |
+| Calendar | Google Calendar API (OAuth) |
+| Email | SMTP + `.ics` invite (mock outbox by default) |
+| Tests | pytest |
+
+---
+
+## 3. Architecture
 
 ```
- Streamlit UI (app.py)
-   ├─ Candidate Portal ── upload ─► resume_extractor (validate type/size/signature, private storage)
-   │                                     │
-   │                        LangGraph INTAKE graph (recruitment_workflow.py)
-   │   extract_resume_text → parse_resume (LLM call 1) → normalize_skills (Python)
-   │   → validate_profile (LLM call 2 + Python guard-rails) → calculate_experience (Python)
-   │   → persist_application → screen_candidate (SQL + Python) → human_review | finish
-   │                                     │ errors → handle_error / parse_failed_review
-   │
-   ├─ HR Dashboard / Candidate Review ── approve, override (audited), correct & re-screen
-   │
-   └─ Interview Scheduler ── LangGraph SCHEDULING graph
-       find_available_slots (Google free/busy ∩ DB bookings) → confirm_booking
-       (reserve in DB → create Google event → confirm in DB) → send_invitation → finish
-                                      │
-                         PostgreSQL: jobs · applications · interviews (+ audit_log)
+ Candidate ─► Candidate Portal ─┐                       ┌─► Google Gemini (resume reading)
+                                │   LangGraph           │
+ HR ───────► HR pages ──────────┼─► INTAKE graph ───────┤
+             (password)         │   SCHEDULING graph ───┼─► Google Calendar (availability, events)
+                                │                       └─► Email (SMTP / mock outbox)
+                                ▼
+                 PostgreSQL: jobs · applications · interviews · audit_log
 ```
 
-**Design rules**
-
-* The LLM extracts and checks facts. It never decides eligibility and never calculates experience.
-* The agents exchange only Pydantic-validated JSON through the workflow state. They never exchange free-form conversation.
-* The three business tables are the source of truth. Human review is a database state, not a paused graph. A review can take days, and every node is idempotent and keyed by `application_id`, so a run can always be re-invoked. This is why no LangGraph checkpointer tables are needed.
-* PostgreSQL enforces correctness under concurrency. Two active interviews cannot overlap (exclusion constraint), an application can have only one active interview (partial unique index), and an interview's job must match its application's job (composite FK).
-
-## 2. Project structure
+**Intake graph** (runs when a resume is submitted)
 
 ```
-app.py                         Streamlit UI (5 pages + candidate status lookup)
-sql/init.sql                   Schema: jobs, applications, interviews, audit_log
-src/config.py                  .env loading + validation
-src/database.py                engine, per-operation session_scope, ORM mappings, init_db
-src/schemas.py                 all Pydantic models / JSON contracts
-src/repository.py              all DB access (parameterized), status transitions, audit
-src/llm_client.py              LLM adapter (Gemini + Mock)
-src/mock_llm.py                deterministic stand-ins for the LLM tasks
-src/resume_extractor.py        upload validation, private storage, PDF/DOCX text
-src/resume_parser_agent.py     LLM call 1 - extraction prompt + schema + repair loop
-src/skill_normalizer.py        taxonomy, alias dictionary, normalization, text scan
-src/data/skill_taxonomy.json   editable canonical skills + aliases
-src/profile_validator_agent.py LLM call 2 - validation prompt + Python guard-rails
-src/experience_calculator.py   authoritative experience policy
-src/screening_service.py       deterministic SQL + decision policy
-src/calendar_service.py        Google Calendar (OAuth, free/busy, events) + mock + slot generation
-src/scheduling_agent.py        booking lifecycle, compensation, reconciliation, email sending
-src/email_service.py           invitation template + ICS, SMTP + mock outbox
-src/recruitment_workflow.py    LangGraph intake + scheduling graphs, HR corrections
-scripts/init_db.py             create schema (controlled setup command)
-scripts/seed_demo.py           demo jobs + sample PDF/DOCX resumes (+ --submit)
-scripts/google_auth.py         one-time Google OAuth consent
-scripts/maintenance.py         reconcile bookings, complete past interviews, retry emails
-tests/                         pytest suite (unit + integration)
-sample_data/                   demo jobs and resumes
+extract_resume_text → parse_resume (LLM call 1) → normalize_skills → validate_profile (LLM call 2 + guard-rails)
+  → calculate_experience → persist_application → screen_candidate → human_review | finish
+                                              (any failure → handle_error / manual-review path)
 ```
 
-## 3. Database (`sql/init.sql`)
+**Scheduling graph** (runs when HR schedules)
 
-| Table | Purpose | Key constraints |
-|---|---|---|
-| `jobs` | Requisitions. `skills` JSONB = `{"mandatory": [...], "preferred": [...]}` | CHECK that JSON is an object with two arrays; `interview_duration_minutes` 15-240 |
-| `applications` | Candidate, validated `skills` (array), `experience` (completed years or NULL), `profile` (evidence, employment, experience calculation), `screening_status`, `screening_result`, `pipeline_status` | unique `(job_id, lower(email))` (duplicate policy); `UNIQUE(application_id, job_id)` as the composite-FK target |
-| `interviews` | `starts_at` / `ends_at` TIMESTAMPTZ + `timezone`, `status`, `google_event_id`, email delivery state | composite FK `(application_id, job_id)`; **EXCLUDE USING gist (tstzrange(...) WITH &&)** for active rows; one active interview per application |
-| `audit_log` (auxiliary) | Who changed what: HR overrides, corrections, bookings, emails | Needed because a "latest value" column cannot preserve history |
+```
+find_available_slots → confirm_booking (reserve in DB → create Google event → confirm in DB)
+  → send_invitation → finish            (conflict → new slots · calendar error → reservation released)
+```
 
-**Why TIMESTAMPTZ instead of DATE + TIME:** the time is unambiguous across timezones, DST and midnight, and it can be used directly in the range exclusion constraint. `timezone` is stored for display.
+Design rules:
+- Agents exchange only **Pydantic-validated JSON** through the workflow state.
+- **Human review is a database state**, not a paused graph. Reviews can take days, and every node is idempotent, so any run can be re-invoked.
+- **The database enforces correctness**: no overlapping interviews, one active application per job and email, and an interview's job always matches its application's job.
 
-**`experience` integer policy:** it stores *completed* years (floor of months / 12). Job minimums are whole years, so `floor(years) >= min` is equivalent to `exact years >= min` and no precision is lost. Exact months are kept in `profile.experience`.
+---
 
-**Re-application policy:** every upload creates a **new application ID**, and earlier attempts are kept with their own resume and result. Only **one active** application per job and email (case-insensitive) is allowed. The partial unique index `ux_applications_job_email_active` enforces this, ignoring `REJECTED` / `SUPERSEDED` rows.
-* An earlier attempt still in `SCREENING` becomes `SUPERSEDED`.
-* A `REJECTED` candidate can apply again, after `REAPPLY_COOLDOWN_DAYS` (default 0).
-* Re-applying is refused while an attempt is approved, interviewing or selected.
-* HR sees all attempts in *Candidate Review*. Candidates see them on the status page.
-* Superseded attempts are hidden from dashboard counts and lists.
+## 4. Quick start
 
-**Pipeline status** (`applications.pipeline_status`):
-`SCREENING → APPROVED → INTERVIEW_SCHEDULED → INTERVIEWED → SELECTED | REJECTED`. Allowed transitions are enforced in `repository.PIPELINE_TRANSITIONS`. The interview outcome is recorded on the application row.
+Requirements: **Python 3.10+**. No Docker or PostgreSQL installation is needed.
 
-## 4. The two-call LLM pipeline
-
-| Step | Who | What |
-|---|---|---|
-| Call 1 | LLM (`resume_parser_agent.py`) | Extracts name, email, raw skill mentions + verbatim evidence, and employment periods (`YYYY-MM`), each with an employment type. The resume is wrapped in `<resume>` tags and treated as untrusted data. Output uses structured outputs (JSON schema), followed by Pydantic validation and up to `LLM_MAX_REPAIR_ATTEMPTS` repairs. |
-| Normalize | Python | Casefold, trim, separator normalization, exact canonical / alias / UNKNOWN, dedupe, raw name and evidence preserved. TensorFlow ≠ PyTorch. |
-| Call 2 | LLM (`profile_validator_agent.py`) | Checks evidence, judges proposed mappings, flags employment contradictions. |
-| Guard-rails | Python | The LLM cannot add skills or change deterministic mappings. Contextual mappings are always REVIEW_REQUIRED. Canonical names must be in the taxonomy. Evidence must appear in the resume text, otherwise the skill is REJECTED. The LLM can only add review flags. |
-
-A regex backstop flags instruction-like resume text (prompt injection) for review. Since the LLM never decides eligibility, injected text cannot make a candidate eligible.
-
-## 5. Experience policy (`experience_calculator.py`)
-
-* Completed calendar months; overlapping periods are merged.
-* Current roles end in the current month (`DEFAULT_TIMEZONE`).
-* Counted: full-time, part-time, contract, freelance, unknown type. Internships only count with `COUNT_INTERNSHIPS_AS_EXPERIENCE=true`. Academic work and personal projects never count.
-* A missing start date, a missing end date (when the role isn't current), an end date before the start date, a future start date, or no employment history at all → **unknown (NULL)** → REVIEW_REQUIRED. Missing data is never treated as zero.
-
-## 6. Screening policy (`screening_service.py`)
-
-`REQUIREMENT_MATCH_SQL` joins `applications` and `jobs`, expands the JSONB requirements with `jsonb_array_elements`, and picks the best candidate skill for each requirement with a `LATERAL` subquery. `decide()` then applies these rules:
-
-| Requirement | PASS | UNKNOWN | FAIL |
-|---|---|---|---|
-| experience | ≥ minimum | not calculable | < minimum |
-| skill | validated skill (exact/alias, or HR-confirmed) | contextual/disputed mapping, **or** name appears in the resume but wasn't validated | not mentioned anywhere |
-
-Overall: any mandatory FAIL → **NOT_ELIGIBLE**. Otherwise any UNKNOWN or blocking profile flag → **REVIEW_REQUIRED**. Otherwise → **ELIGIBLE**. Preferred skills are reported but never change the status. The result and status are saved in one transaction. ELIGIBLE candidates still need an HR click unless `AUTO_APPROVE_ELIGIBLE=true`.
-
-## 7. Booking lifecycle (calendar + DB without a shared transaction)
-
-1. Re-check live free/busy for the exact slot.
-2. **Reserve:** insert the interview as `PENDING_CONFIRMATION` with a pre-generated `google_event_id`. The exclusion constraint makes this the atomic lock.
-3. **Create the event** with that ID. A retry gets HTTP 409, which the code treats as "already created", so there are never duplicates. If creation fails, the reservation is cancelled to release the slot.
-4. **Confirm** in the DB. If this fails, the row stays pending and *Reconcile pending bookings* (UI button or `scripts/maintenance.py`) confirms it if the event exists, or releases it.
-5. **Email** only for CONFIRMED rows, with an atomic `UPDATE ... WHERE email_status IN ('NOT_SENT','FAILED') AND attempts < max` claim. A failed email never affects the booking and is retried separately. If the process crashes mid-send, the status stays `SENDING`. HR checks the outbox or SMTP log and clicks *Allow resend*, so the system never auto-sends a possible duplicate.
-
-The email is rendered from a fixed template using only the confirmed booking details, with an `.ics` invite attached.
-
-## 8. Setup
-
-### Local setup (Python 3.10+, no Docker or PostgreSQL install needed)
-
-```bash
+```powershell
+# 1. install
 python -m venv .venv
-.venv\Scriptsctivate         # Windows   (macOS/Linux: source .venv/bin/activate)
+.venv\Scripts\activate              # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env           # DATABASE_URL=pgserver:private/pgdata = embedded local PostgreSQL
-python -m scripts.init_db      # create tables (first time / after schema changes)
-python -m scripts.seed_demo    # optional demo jobs + sample resumes
-streamlit run app.py           # http://localhost:8501
+
+# 2. configure (works as-is in mock mode)
+copy .env.example .env              # macOS/Linux: cp .env.example .env
+
+# 3. create the database tables (first time, and after schema changes)
+python -m scripts.init_db
+
+# 4. optional: demo jobs + sample PDF/DOCX resumes
+python -m scripts.seed_demo
+
+# 5. run
+streamlit run app.py
 ```
 
-To use your own PostgreSQL server instead, set `DATABASE_URL=postgresql+psycopg://user:password@host:5432/db`.
+Open **http://localhost:8501**. HR password: the `HR_PASSWORD` value in `.env` (`change-me` by default).
 
-`HR_PASSWORD` protects the HR pages. Candidates only see their own application, using application ID + email.
+---
 
-### Using the real LLM (Gemini)
+## 5. Configuration
+
+All settings live in `.env` (see `.env.example`). Never commit `.env`, `credentials.json` or `token.json`; they are git-ignored.
+
+### 5.1 Main settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | `pgserver:private/pgdata` | Embedded local PostgreSQL, or any `postgresql+psycopg://user:pass@host:5432/db` |
+| `LOCAL_DB_PORT` | `5433` | Port of the embedded database |
+| `MOCK_MODE` | `true` | Mock every integration. Override per integration with `MOCK_LLM`, `MOCK_CALENDAR`, `MOCK_EMAIL` |
+| `HR_PASSWORD` | `change-me` | Shared password for HR pages |
+| `DEFAULT_TIMEZONE` | `Asia/Kolkata` | Timezone for slots and "current month" |
+| `WORKING_HOURS_START` / `_END` | `10` / `18` | Interview hours |
+| `MIN_NOTICE_HOURS` | `24` | Earliest bookable slot from now |
+| `COUNT_INTERNSHIPS_AS_EXPERIENCE` | `false` | Experience policy |
+| `AUTO_APPROVE_ELIGIBLE` | `false` | Move ELIGIBLE candidates straight to APPROVED |
+| `REAPPLY_COOLDOWN_DAYS` | `0` | Wait time before a rejected candidate can re-apply |
+
+### 5.2 Gemini (resume reading)
 
 ```dotenv
 MOCK_LLM=false
 LLM_PROVIDER=gemini
-GEMINI_API_KEY=...                  # https://aistudio.google.com/apikey
+GEMINI_API_KEY=...                 # https://aistudio.google.com/apikey
 GEMINI_MODEL=gemini-3.5-flash-lite
+LLM_TIMEOUT_SECONDS=90
 ```
 
-Check it on one resume with `python -m scripts.check_llm`. The adapter uses JSON-schema structured output and a hard timeout (`LLM_TIMEOUT_SECONDS`). To add another provider, implement `generate_json` in `src/llm_client.py`.
+Check it on one resume: `python -m scripts.check_llm` (or `python -m scripts.check_llm path\to\resume.pdf`).
 
-### Google Calendar OAuth
+### 5.3 Google Calendar (interview panel)
 
-1. In Google Cloud Console: create a project → enable **Google Calendar API**.
-2. Set up the OAuth consent screen (internal, or external with yourself as a test user).
-3. Go to **Credentials → Create credentials → OAuth client ID → Desktop app** and download the JSON as `credentials.json` into the project root.
+1. In Google Cloud Console, create a project and enable the **Google Calendar API**.
+2. Set up the **OAuth consent screen** and add your Google account under **Audience → Test users**.
+3. Go to **Credentials → Create credentials → OAuth client ID → Desktop app**, download the JSON, and save it as `credentials.json` in the project root.
 4. In `.env`:
    ```dotenv
    MOCK_CALENDAR=false
-   GOOGLE_CALENDAR_IDS=panel.lead@yourco.com,engineer2@yourco.com
+   GOOGLE_CALENDAR_IDS=primary          # or comma-separated panel calendar ids/emails
+   GOOGLE_CREATE_MEET_LINK=true
    ```
-   The authorizing account must be able to read free/busy on every listed calendar, and to create events on the **first** one.
-5. Run `python -m scripts.google_auth` once. A browser opens and `token.json` is written. It is refreshed automatically and git-ignored.
+5. Sign in once: `python -m scripts.google_auth`. This writes `token.json`, which is refreshed automatically.
+6. Check it: `python -m scripts.check_calendar --write`. This creates and deletes a test event.
 
-Then check it with `python -m scripts.check_calendar --write`.
-
-### Email (SMTP)
+### 5.4 Email (SMTP)
 
 ```dotenv
 MOCK_EMAIL=false
-SMTP_HOST=smtp.gmail.com     # or your provider
+SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USE_TLS=true
 SMTP_USERNAME=recruiting@yourco.com
-SMTP_PASSWORD=<app password>  # Gmail: Google Account → Security → App passwords
+SMTP_PASSWORD=<app password>       # Gmail: Google Account → Security → App passwords
 EMAIL_FROM=recruiting@yourco.com
 RECRUITER_CONTACT_EMAIL=recruiting@yourco.com
 ```
 
-In mock mode, emails are written as `.eml` files to `private/mock/outbox/`.
+In mock mode, invitations are written as `.eml` files to `private/mock/outbox/`.
 
-### Maintenance job
+### 5.5 What works without credentials
 
-Schedule `python -m scripts.maintenance` every ~10 minutes (cron or Windows Task Scheduler). It reconciles pending bookings, marks past interviews completed, and retries failed emails.
+| Feature | Mock mode | Needs |
+|---|---|---|
+| Jobs, uploads, PDF/DOCX extraction | ✅ | - |
+| Resume reading (Call 1 + Call 2) | ✅ rule-based stand-in | Gemini key |
+| Skill normalization, experience, screening | ✅ (same code) | - |
+| HR review, corrections, audit log | ✅ | - |
+| Slots, booking, conflicts, reconciliation | ✅ synthetic calendar | Google OAuth |
+| Invitation email | ✅ written to outbox | SMTP |
 
-## 9. Tests
+---
 
-```bash
-pip install pytest pgserver                 # pgserver = throw-away local PostgreSQL for integration tests
-pytest -q                                   # unit + integration
-pytest -q -m "not integration"              # unit only, no database needed
-# or an existing PostgreSQL test database (it is WIPED):
-TEST_DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/recruiter_test pytest -q
-```
+## 6. Using the app
 
-| Area | Tests |
-|---|---|
-| Schemas / jobs | valid job, malformed skill JSON, both mandatory+preferred, invalid LLM output, bounded repair |
-| Extraction | PDF, DOCX, bad extension, oversized, wrong signature/MIME, empty PDF, path traversal |
-| Normalization | ML → Machine Learning, torch → PyTorch, unknown, dedupe, TensorFlow ≠ PyTorch, validator guard-rails |
-| Experience | overlap, current, floor, missing dates, end < start, internships/projects, no history |
-| Screening | match, missing, unknown vs fail, min experience, review routing, SQL-vs-Python parity, SQL injection |
-| Scheduling | slot generation, conflicts, concurrent reservations, calendar failure, DB failure + reconcile, email failure/retry/bound, cancel/complete |
-| Workflow | eligible / not eligible / review, prompt injection, duplicates, idempotent rerun, invalid parser output, LLM outage, HR correction + audit, end-to-end booking + email |
+### 6.1 Pages
 
-## 10. Demo walkthrough (mock mode)
+| Page | Who | Purpose |
+|---|---|---|
+| **Candidate Portal** | Candidates | Choose a job, upload a resume, see the result |
+| **Application Status** | Candidates | Look up an application by ID + email |
+| **HR Dashboard** | HR | Pipeline counts, jobs, applicants; approve, reject, re-run, reopen; job settings |
+| **Create Job** | HR | Post a job with experience and skill requirements |
+| **Candidate Review** | HR | Evidence per requirement, fix extracted data, re-screen |
+| **Interview Scheduler** | HR | Find slots, book, cancel, complete, record the final decision |
+
+Direct links work too, e.g. `http://localhost:8501/?page=Create Job`.
+
+**HR sign-in:** enter any name (recorded in the audit log) plus `HR_PASSWORD`.
+
+### 6.2 Demo walkthrough (mock mode)
 
 1. `python -m scripts.seed_demo` creates 2 jobs and writes sample resumes to `sample_data/resumes/generated/`.
-2. **Candidate Portal:** pick *Machine Learning Engineer*, upload `priya_sharma.pdf`. Result: **ELIGIBLE**, with "torch" → PyTorch (alias) and "ML" → Machine Learning.
-3. Upload `anita_rao.pdf`. Result: **REVIEW_REQUIRED** (year-only dates, so experience is unknown).
-4. Upload `rahul_verma.docx`. Result: **NOT_ELIGIBLE**, with the reasons shown.
-5. **Candidate Review:** open Anita, set `start_date`/`end_date`, tick *resolved*, then *Save corrections and re-screen*. She becomes ELIGIBLE, and the change is in the audit history.
+2. **Candidate Portal:** apply to *Machine Learning Engineer* with `priya_sharma.pdf`. Result: **Eligible** (`torch` → PyTorch, `ML` → Machine Learning).
+3. Apply with `anita_rao.pdf`. Result: **Needs review** (year-only dates, so experience is unknown).
+4. Apply with `rahul_verma.docx`. Result: **Not eligible**, with the unmet requirements listed.
+5. **Candidate Review:** open Anita, set the missing dates, tick *resolved*, then *Save corrections and re-screen*. She becomes Eligible, and the change is audited.
 6. **HR Dashboard:** approve Priya.
-7. **Interview Scheduler:** *Find available slots* (synthetic mock availability: lunch and Tue/Thu meetings are blocked), then pick one and *Confirm booking*. The interview is CONFIRMED, the email is SENT, and an `.eml` + `.ics` appears in `private/mock/outbox/`.
-8. Try booking another candidate into the same time. You get a **CONFLICT** with alternative slots.
-9. After the interview, use *Mark completed* and then *Record decision*. The application ends as SELECTED or REJECTED.
+7. **Interview Scheduler:** *Find available slots*, then *Confirm booking*. The interview is confirmed and the invitation (`.eml` + `.ics`) appears in the outbox.
+8. Book another candidate into the same time. You get a **conflict** with alternative slots.
+9. After the interview: *Mark completed*, then *Record decision* (Selected / Rejected).
 
-## 11. Mock-mode vs credentials checklist
+---
 
-| Feature | Mock mode | Needs credentials |
+## 7. How it works
+
+### 7.1 Resume pipeline: two LLM calls + Python checks
+
+| Step | Done by | What happens |
 |---|---|---|
-| Job creation, taxonomy, JSONB validation | ✅ | - |
-| Resume upload, PDF/DOCX extraction | ✅ | - |
-| Call 1 / Call 2 | ✅ rule-based stand-in | Real Gemini: `GEMINI_API_KEY`, `GEMINI_MODEL` |
-| Normalization, grounding, experience, screening | ✅ (identical code) | - |
-| HR review, corrections, audit | ✅ | - |
-| Slot finding / booking / conflicts / reconcile | ✅ synthetic calendar (labelled) | Real availability: Google OAuth |
-| Invitation email | ✅ written to outbox | Delivery: SMTP |
-| PostgreSQL | **required** in every mode | - |
+| Text extraction | Python | PDF/DOCX → text; scanned or empty files are rejected |
+| **Call 1: extract** | Gemini | Name, email, skills with verbatim evidence, jobs with `YYYY-MM` dates and type. The resume is wrapped in `<resume>` tags as untrusted data. Output follows a JSON schema, is validated with Pydantic, and gets up to 2 repair attempts |
+| Normalize | Python | Lowercase, alias map, dedupe; unknown skills are flagged, never guessed (TensorFlow ≠ PyTorch) |
+| **Call 2: validate** | Gemini | Checks that each skill has supporting evidence and flags date contradictions |
+| Guard-rails | Python | Evidence must appear in the resume text (otherwise REJECTED). The LLM can't add skills or change alias mappings. LLM-suggested "related" skills always need HR confirmation |
 
-## 12. Security, privacy and retention
+Both calls are told today's date and follow the resume's own section headings (Experience vs Projects). A regex backstop flags instruction-like text (prompt injection), which can't help anyway because the LLM never decides eligibility.
 
-* Uploads are checked by extension, MIME type, size and file signature (`%PDF-` / DOCX zip structure), with a zip-bomb guard and a page limit. Files are stored under random server-generated names in `private/` and never served publicly.
-* Resume text is untrusted. It is delimited in prompts, injection attempts are flagged, the UI shows it only as text (never as HTML), and it is not logged.
-* All SQL is parameterized. Secrets come from `.env` and are never logged. Error messages are sanitized.
-* Screening uses only skills and experience. Name, gender, age and photo are not inputs. LLM "confidence" is shown only as extraction metadata, never as a measure of candidate ability.
-* **Retention:** delete resumes and the `profile` JSON for rejected or inactive candidates after your policy period (e.g. 6-12 months). Delete the file in `private/resumes/` and null `resume_path`/`profile`. Keep `audit_log` entries for compliance, without resume content.
+### 7.2 Experience calculation (`experience_calculator.py`)
 
-## 13. Developer: inspecting the database
+- Counts **completed calendar months**; overlapping jobs are **merged**, so they're never double-counted.
+- Current roles run up to the current month.
+- Counted: full-time, part-time, contract, freelance, unspecified. Internships only if enabled. Academic work and personal projects are never counted.
+- Missing or contradictory dates give **unknown**, never zero, which sends the application to review.
+- Stored as completed whole years; exact months are kept in the profile.
 
-| Way | Command / settings |
+### 7.3 Deterministic screening (`screening_service.py`)
+
+A SQL query joins the application with its job, expands the JSON requirements (`jsonb_array_elements`), and picks the best matching skill for each one (`LATERAL`). The decision rules:
+
+| Check | PASS | UNKNOWN | FAIL |
+|---|---|---|---|
+| Experience | ≥ minimum | can't be calculated | < minimum |
+| Skill | validated match | mapping needs confirmation, or mentioned but not validated | not in the resume |
+
+**Result:** any mandatory FAIL → **NOT_ELIGIBLE**; otherwise any UNKNOWN or open review flag → **REVIEW_REQUIRED**; otherwise → **ELIGIBLE**. Preferred skills are reported but never change the result.
+
+### 7.4 Conflict-safe booking
+
+Google Calendar and PostgreSQL can't share a transaction, so the booking runs as a sequence of steps:
+
+1. Re-check live availability for the exact slot.
+2. **Reserve** in the database (`PENDING_CONFIRMATION`) with a pre-generated event ID. The exclusion constraint is the atomic lock.
+3. **Create the Google event** with that ID. A retry reuses it, so there are no duplicate events. If this fails, the reservation is released.
+4. **Confirm** in the database. If this fails, *Reconcile pending bookings* (or `scripts/maintenance.py`) finishes the booking later.
+5. **Send the invitation** through an atomic claim, so it's never sent twice. An email failure never cancels the booking.
+
+### 7.5 Application lifecycle
+
+```
+SCREENING ─► APPROVED ─► INTERVIEW_SCHEDULED ─► INTERVIEWED ─► SELECTED / REJECTED
+    │            └──────────────► REJECTED (HR)
+    └─► SUPERSEDED (candidate uploaded a newer resume for the same job)
+```
+
+- **Re-applying:** every upload gets a **new application ID**, and old attempts are kept as history.
+- Only **one active** application per job and email is allowed.
+- A rejected candidate can apply again (optional cooldown).
+- Re-applying is blocked while an attempt is approved or interviewing.
+
+---
+
+## 8. Database
+
+Schema file: `sql/init.sql` (idempotent; apply with `python -m scripts.init_db`).
+
+| Table | Holds | Key rules |
+|---|---|---|
+| `jobs` | Title, minimum experience, `skills` JSONB `{mandatory, preferred}`, interview length, status | JSON shape enforced by CHECK |
+| `applications` | Candidate, validated `skills` (JSONB), `experience`, `profile` (evidence, history), screening result, pipeline stage | One **active** application per job + email (partial unique index) |
+| `interviews` | Start/end (`TIMESTAMPTZ`) + timezone, status, Google event ID, Meet link, email status | **Exclusion constraint:** active interviews never overlap; composite FK keeps job and application consistent |
+| `audit_log` | Who did what and when | History of HR actions, re-screens, bookings, emails |
+
+**Where the data lives (local mode):** `private/pgdata/`, served by a portable PostgreSQL from the `pgserver` package on `127.0.0.1:5433`. Uploaded resume files are in `private/resumes/`. Stop the server with `python -m scripts.stop_db`.
+
+---
+
+## 9. Project structure
+
+```
+app.py                          Streamlit UI (candidate + HR pages)
+sql/init.sql                    Database schema
+src/
+  config.py                     .env loading and validation
+  database.py                   engine, sessions, ORM mappings, embedded PostgreSQL startup
+  schemas.py                    Pydantic models (all JSON contracts)
+  repository.py                 all database access, status transitions, audit log
+  llm_client.py                 LLM adapter (Gemini + mock)
+  mock_llm.py                   rule-based stand-ins for the LLM tasks
+  resume_extractor.py           upload validation, private storage, PDF/DOCX text
+  resume_parser_agent.py        LLM call 1: extraction prompt, schema, repair loop
+  profile_validator_agent.py    LLM call 2: validation prompt + Python guard-rails
+  skill_normalizer.py           taxonomy, aliases, normalization
+  data/skill_taxonomy.json      approved skills + aliases (editable)
+  experience_calculator.py      experience policy
+  screening_service.py          screening SQL + decision rules
+  calendar_service.py           Google Calendar + mock + slot generation
+  scheduling_agent.py           booking lifecycle, reconciliation, invitations
+  email_service.py              invitation template, .ics, SMTP + mock outbox
+  recruitment_workflow.py       LangGraph intake + scheduling graphs, HR corrections
+  db_explorer.py                read-only database helpers for developer tools
+  ui_theme.py                   UI styling and components
+scripts/
+  init_db.py  seed_demo.py  google_auth.py  maintenance.py
+  check_llm.py  check_calendar.py  show_db.py  stop_db.py
+tools/db_viewer.py              developer database viewer (browser, read-only)
+tests/                          pytest suite
+sample_data/                    demo jobs and fictional resumes
+```
+
+---
+
+## 10. Testing
+
+```powershell
+pytest -q                          # all 109 tests (integration tests start a throw-away PostgreSQL)
+pytest -q -m "not integration"     # unit tests only, no database
+```
+
+To use an existing PostgreSQL test database instead (it is **wiped**), set `TEST_DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/recruiter_test`.
+
+| Area | Covered |
 |---|---|
-| **Browser viewer (dev only)** | `streamlit run tools/db_viewer.py --server.port 8502`, then open http://localhost:8502 (read-only: rows, schema, SQL) |
-| Quick look from the terminal | `python -m scripts.show_db schema` · `jobs` · `apps` · `match <id>` · `sql` |
-| Any read-only SQL | `python -m scripts.show_db query "SELECT * FROM applications"` |
-| Interactive SQL shell (psql) | `python -m scripts.show_db shell` (full access: be careful) |
-| GUI (DBeaver / pgAdmin) | host `127.0.0.1`, port `5433` (`LOCAL_DB_PORT`), database `postgres`, user `postgres`, no password |
+| Schemas & LLM output | Valid/invalid jobs, malformed JSON, bounded repair, Gemini adapter (timeouts, retries, refusals) |
+| Uploads | PDF, DOCX, bad extension, oversized, fake file signature, empty PDF, path traversal |
+| Skills | Aliases, unknown skills, dedupe, TensorFlow ≠ PyTorch, validator guard-rails |
+| Experience | Overlaps, current role, missing or contradictory dates, internships/projects |
+| Screening | Pass/fail/unknown rules, SQL-vs-Python parity, SQL injection |
+| Scheduling | Slot generation, conflicts, concurrent booking, calendar/database failures + reconciliation, email retry and dedup |
+| Workflow | End-to-end intake and booking, prompt injection, re-application rules, HR corrections + audit |
 
-The embedded local database (`DATABASE_URL=pgserver:private/pgdata`) always listens on `LOCAL_DB_PORT` (default 5433). It starts with the app or any script; `python -m scripts.stop_db` stops it.
+---
 
-## 14. Troubleshooting
+## 11. Developer tools
 
-| Symptom | Fix |
+| Task | Command |
 |---|---|
-| "Configuration error" on start | Check `.env`. `DATABASE_URL` is required. Non-mock integrations need their variables. |
-| "Check that PostgreSQL is running and initialized" | Start the DB and run `python -m scripts.init_db`. |
-| Resume "No readable text found" | The file is a scanned image PDF. OCR is not supported, so ask for a text PDF or DOCX. |
-| Google "token not found / refresh failed" | Run `python -m scripts.google_auth` again. |
-| Google free/busy error for a calendar | The authorizing account can't see that calendar. Share it (at least free/busy) with that account. |
-| Booking shows DB_ERROR | Click *Reconcile pending bookings*. It confirms or releases without duplicating the event. |
-| Email stuck in SENDING | The process crashed mid-send. Check the outbox or SMTP logs, then *Allow resend*. |
-| LLM output fails validation repeatedly | The application goes to REVIEW_REQUIRED for manual entry. Check the model ID and `LLM_MAX_REPAIR_ATTEMPTS`. |
-| pip very slow / NameResolutionError | A machine-wide pip `extra-index-url` is unreachable (see `pip config debug`, e.g. `C:\ProgramData\pip\pip.ini`). Remove it there, or install with `PIP_CONFIG_FILE=NUL` (Windows) / `PIP_CONFIG_FILE=/dev/null`. |
+| Check the LLM on one resume | `python -m scripts.check_llm [resume.pdf]` |
+| Check Google Calendar | `python -m scripts.check_calendar --write` |
+| Database viewer in the browser | `streamlit run tools/db_viewer.py --server.port 8502` → http://localhost:8502 |
+| Tables, jobs, applications | `python -m scripts.show_db schema` · `jobs` · `apps` |
+| How one application was screened | `python -m scripts.show_db match <id>` |
+| Read-only SQL | `python -m scripts.show_db query "SELECT * FROM applications"` |
+| SQL shell (psql) | `python -m scripts.show_db shell` |
+| GUI (DBeaver / pgAdmin) | host `127.0.0.1`, port `5433`, database `postgres`, user `postgres`, no password |
+| Periodic maintenance | `python -m scripts.maintenance` (reconcile bookings, complete past interviews, retry emails) |
+
+---
+
+## 12. Security and privacy
+
+- **Uploads** are checked by extension, MIME type, size and file signature (zip-bomb guard, page limit). They're stored under random names in `private/` and never served publicly.
+- **Resume text is untrusted:** it's delimited in prompts, injection attempts are flagged, it's never rendered as HTML, and it isn't logged.
+- **SQL** is always parameterized. **Secrets** come only from `.env` and are never logged.
+- **Access:** HR pages need the HR password. Candidates only see their own application (ID + email).
+- **Fairness:** screening uses only skills and experience; name, gender, age and photo are not inputs.
+- **Retention:** delete resumes and parsed profiles of inactive candidates after your policy period. Keep `audit_log` entries without resume content.
+
+---
+
+## 13. Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| "The database has no tables yet" | `python -m scripts.init_db` |
+| "Configuration error" on start | Check `.env`. Integrations that aren't mocked need their variables |
+| HR sign-in "Wrong HR password" | Use the `HR_PASSWORD` from `.env`. The browser may have auto-filled a generated password |
+| Resume "No readable text found" | Scanned image PDF; upload a text PDF or DOCX |
+| Resume marked ERROR "did not respond" | The LLM timed out. Use *Re-run processing* on the HR Dashboard |
+| Google "Access blocked … not completed verification" | Add your account under OAuth consent screen → Audience → Test users |
+| Google "token not found / refresh failed" | `python -m scripts.google_auth` |
+| Booking shows `DB_ERROR` | Interview Scheduler → Maintenance → *Reconcile pending bookings* |
+| Email stuck in `SENDING` | Check the outbox/SMTP log, then *Allow resend* |
+| GUI can't connect to the database | Run any project command first (starts the DB); port `5433` |
+| `pip install` very slow / NameResolutionError | A machine-wide pip `extra-index-url` is unreachable; remove it (see `pip config debug`) |
