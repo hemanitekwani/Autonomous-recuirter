@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+credentials.json
+token.json
+service_account.json
+*.iam.gserviceaccount.com.json
+private/
+config/custom_skills.json
+sample_data/resumes/generated/
+client_secret*.json

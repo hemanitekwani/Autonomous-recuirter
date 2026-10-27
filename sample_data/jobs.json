@@ -1,0 +1,18 @@
+[
+  {
+    "title": "Machine Learning Engineer",
+    "min_experience_years": 3,
+    "mandatory_skills": ["Python", "PyTorch", "ML"],
+    "preferred_skills": ["SQL", "Docker"],
+    "interview_duration_minutes": 45,
+    "status": "OPEN"
+  },
+  {
+    "title": "Backend Engineer (Java)",
+    "min_experience_years": 2,
+    "mandatory_skills": ["Java", "Spring Boot", "SQL"],
+    "preferred_skills": ["Docker", "Kubernetes"],
+    "interview_duration_minutes": 60,
+    "status": "OPEN"
+  }
+]

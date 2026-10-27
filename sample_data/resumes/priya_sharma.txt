@@ -1,0 +1,17 @@
+Priya Sharma
+priya.sharma@example.com | +91 98765 43210 | Bengaluru
+
+Summary
+Machine learning engineer building production NLP systems.
+
+Skills: Python, ML, torch, SQL, Docker, NLP
+
+Experience
+Senior ML Engineer, Example AI Labs, Jul 2022 - Present
+Trained neural networks using torch for document classification.
+Developed ML models using Python and deployed them with Docker.
+Data Scientist, Sample Analytics, Jun 2020 - Jun 2022
+Built forecasting pipelines in Python and SQL.
+
+Education
+B.Tech Computer Science, Example Institute of Technology, 2016 - 2020

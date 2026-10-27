@@ -1,0 +1,11 @@
+Rahul Verma
+rahul.verma@example.com | Pune
+
+Skills: Java, Spring Boot, MySQL, Git
+
+Experience
+Software Engineer, Demo Systems, Jan 2025 - Present
+Built REST services in Java with Spring Boot and MySQL.
+
+Education
+B.E. Information Technology, Sample College of Engineering, 2020 - 2024
